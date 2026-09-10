@@ -254,21 +254,22 @@ func (p *cachedVolcengineTOSCredentialProvider) GetCredential(ctx context.Contex
 
 	fresh, err := p.refresh(ctx)
 	if err != nil {
-		return p.credentialAfterRefreshError(ctx, err)
+		return p.credentialAfterRefreshError(err)
 	}
 	if !time.Now().Before(fresh.expiresAt) {
-		return p.credentialAfterRefreshError(ctx, errors.New("Volcengine STS returned an expired credential"))
+		return p.credentialAfterRefreshError(errors.New("Volcengine STS returned an expired credential"))
 	}
 	p.credential = *fresh
 	return p.credential, nil
 }
 
 // credentialAfterRefreshError returns the cached credential while it is still
-// valid. Once it has expired, the refresh error must be surfaced.
-func (p *cachedVolcengineTOSCredentialProvider) credentialAfterRefreshError(ctx context.Context, refreshErr error) (volcengineTOSCredential, error) {
-	if err := ctx.Err(); err != nil {
-		return volcengineTOSCredential{}, err
-	}
+// valid. Once it has expired, the refresh error must be surfaced. The context
+// is deliberately not consulted here: on this path it only ever carries the
+// internal refresh timeout, and a refresh that timed out is exactly the case
+// in which the still-valid credential must keep being served. When there is
+// nothing to serve, refreshErr already wraps the context error.
+func (p *cachedVolcengineTOSCredentialProvider) credentialAfterRefreshError(refreshErr error) (volcengineTOSCredential, error) {
 	if p.credential.accessKey != "" && time.Now().Before(p.credential.expiresAt) {
 		return p.credential, nil
 	}

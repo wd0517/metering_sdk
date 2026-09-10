@@ -447,6 +447,32 @@ func TestVolcengineTOSCredentialsResolvesLazilyAndRecovers(t *testing.T) {
 	require.Equal(t, 2, calls)
 }
 
+func TestVolcengineTOSCredentialsServesCachedCredentialWhileSTSHangs(t *testing.T) {
+	// Inside the refresh window (duration/10 = 6 min) with a minute left.
+	sts := &fakeVolcengineSTS{}
+	sts.assumeRoleFn = func(context.Context, volcengineTOSCredential, string) (*volcengineTOSCredential, error) {
+		return stsCredential("tmp", time.Minute), nil
+	}
+	creds := &volcengineTOSCredentials{
+		provider:       newAssumeRoleVolcengineCredentialProvider(staticTOSCredentialProvider(), sts, testTOSRoleTRN),
+		refreshTimeout: 200 * time.Millisecond,
+	}
+	first, err := creds.resolve()
+	require.NoError(t, err)
+
+	// STS hangs until the refresh deadline fires. The timeout is the only
+	// context on this path, so it must not discard the still-valid credential.
+	sts.assumeRoleFn = func(ctx context.Context, _ volcengineTOSCredential, _ string) (*volcengineTOSCredential, error) {
+		<-ctx.Done()
+		return nil, fmt.Errorf("Volcengine STS AssumeRole: %w", ctx.Err())
+	}
+	started := time.Now()
+	second, err := creds.resolve()
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+	require.Less(t, time.Since(started), 5*time.Second)
+}
+
 type blockingTransport struct {
 	called bool
 }
