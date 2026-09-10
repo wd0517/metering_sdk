@@ -92,7 +92,7 @@ func TestCOSProviderFactory(t *testing.T) {
 func TestTOSProviderFactory(t *testing.T) {
 	providerConfig := &storage.ProviderConfig{
 		Type:   storage.ProviderTypeTOS,
-		Bucket: "nextgen-metering-dev-cn-beijing-ng",
+		Bucket: "metering-bucket",
 		Region: "cn-beijing",
 		TOS: &storage.TOSConfig{
 			AccessKey:       "ak",

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,10 +23,14 @@ import (
 
 const (
 	defaultTOSAssumeRoleSessionName = "metering-writer"
-	// Match live Role MaxSessionDuration and the TiKV Volcengine OIDC client.
-	// The official Go OIDC provider sends DurationSeconds+60 and is rejected
-	// with InvalidParameter when the Role max is 3600.
+	// Volcengine IAM roles default to MaxSessionDuration=3600s and STS rejects
+	// a larger DurationSeconds with InvalidParameter, so request exactly that.
 	tosAssumeRoleDuration = 3600 * time.Second
+	// tosCredentialRefreshTimeout bounds one credential refresh, which is at
+	// most two STS hops (AssumeRoleWithOIDC, then AssumeRole). The TOS
+	// credentials interface has no request context, so this is the only
+	// deadline on that path.
+	tosCredentialRefreshTimeout = 10 * time.Second
 	// A successful AssumeRoleWithOIDC response is a few KB (the SessionToken
 	// dominates). 64KB leaves ample headroom while still bounding a hostile or
 	// misrouted endpoint; exceeding it is reported explicitly instead of
@@ -33,22 +38,6 @@ const (
 	oidcSTSMaxResponseBytes    = 64 << 10
 	envVolcengineOIDCTokenFile = "VOLCENGINE_OIDC_TOKEN_FILE"
 	envVolcengineOIDCRoleTRN   = "VOLCENGINE_OIDC_ROLE_TRN"
-)
-
-var (
-	assumeVolcengineRole = assumeVolcengineRoleWithSTS
-	oidcSTSURL           = volcengineOIDCSTSURL
-	// tosCredentialRefreshTimeout bounds one credential refresh, which is at
-	// most two STS hops (AssumeRoleWithOIDC, then AssumeRole). The TOS
-	// credentials interface has no request context, so this is the only
-	// deadline on that path. Package-level so tests can shorten it.
-	tosCredentialRefreshTimeout = 10 * time.Second
-	// HTTP clients for the two STS hops. Injected explicitly instead of relying
-	// on http.DefaultClient so tests can swap transports without mutating
-	// process-wide state. Their timeout is a backstop above
-	// tosCredentialRefreshTimeout; the context is the deadline that fires.
-	oidcHTTPClient = &http.Client{Timeout: 12 * time.Second}
-	stsHTTPClient  = &http.Client{Timeout: 12 * time.Second}
 )
 
 // TOSProvider Volcengine TOS storage provider implementation.
@@ -60,13 +49,15 @@ type TOSProvider struct {
 
 // NewTOSProvider creates a new TOS storage provider.
 func NewTOSProvider(providerConfig *ProviderConfig) (*TOSProvider, error) {
-	return newTOSProvider(providerConfig, nil)
+	return newTOSProvider(providerConfig, nil, nil)
 }
 
-// newTOSProvider builds the provider. next is the network transport placed
-// behind the credential guard; nil selects the SDK's tuned default transport
-// (dial/read/write timeouts, DNS cache, connection pool). Tests inject a fake.
-func newTOSProvider(providerConfig *ProviderConfig, next vtos.Transport) (*TOSProvider, error) {
+// newTOSProvider builds the provider. sts is the STS client behind the
+// credential chain and next is the network transport behind the credential
+// guard; nil selects the real STS client and the SDK's tuned default
+// transport (dial/read/write timeouts, DNS cache, connection pool). Tests
+// inject fakes.
+func newTOSProvider(providerConfig *ProviderConfig, sts volcengineSTSClient, next vtos.Transport) (*TOSProvider, error) {
 	if providerConfig.Type != ProviderTypeTOS {
 		return nil, fmt.Errorf("invalid provider type: %s, expected: %s", providerConfig.Type, ProviderTypeTOS)
 	}
@@ -82,23 +73,29 @@ func newTOSProvider(providerConfig *ProviderConfig, next vtos.Transport) (*TOSPr
 		return nil, fmt.Errorf("region is required for TOS provider (SigV4 signing scope), even when endpoint is set")
 	}
 
-	endpoint, err := buildTOSEndpoint(region, providerConfig.Endpoint)
+	if sts == nil {
+		sts = newVolcengineSTS(region)
+	}
+	credentialProvider, err := newVolcengineTOSCredentialProvider(providerConfig.TOS, sts)
 	if err != nil {
 		return nil, err
 	}
-
-	credentials, err := newVolcengineTOSCredentials(providerConfig)
-	if err != nil {
-		return nil, err
+	credentials := &volcengineTOSCredentials{
+		provider:       credentialProvider,
+		refreshTimeout: tosCredentialRefreshTimeout,
 	}
 
 	if next == nil {
 		transportConfig := vtos.DefaultTransportConfig()
 		next = vtos.NewDefaultTransport(&transportConfig)
 	}
-	client, err := vtos.NewClientV2(endpoint,
+	client, err := vtos.NewClientV2(buildTOSEndpoint(region, providerConfig.Endpoint),
 		vtos.WithRegion(region),
 		vtos.WithCredentials(credentials),
+		// WithTransport is deprecated in favour of WithHTTPTransport, but it is
+		// the only hook that sees the signed *vtos.Request while keeping the
+		// SDK's default transport underneath; WithHTTPTransport discards that
+		// transport's tuning.
 		vtos.WithTransport(&tosCredentialGuardTransport{creds: credentials, next: next}),
 	)
 	if err != nil {
@@ -112,26 +109,13 @@ func newTOSProvider(providerConfig *ProviderConfig, next vtos.Transport) (*TOSPr
 	}, nil
 }
 
-// buildTOSEndpoint returns the TOS host: an explicit endpoint with any scheme
-// stripped, or the regional intranet endpoint. Callers guarantee region is set.
-func buildTOSEndpoint(region, endpoint string) (string, error) {
-	if value := strings.TrimSpace(endpoint); value != "" {
-		value = strings.TrimPrefix(value, "https://")
-		value = strings.TrimPrefix(value, "http://")
-		if value == "" {
-			return "", fmt.Errorf("invalid TOS endpoint")
-		}
-		return value, nil
+// buildTOSEndpoint returns the explicit endpoint or the regional intranet
+// endpoint. The TOS SDK parses an optional http:// or https:// scheme itself.
+func buildTOSEndpoint(region, endpoint string) string {
+	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
+		return endpoint
 	}
-	return fmt.Sprintf("tos-%s.ivolces.com", strings.TrimSpace(region)), nil
-}
-
-func buildVolcengineSTSEndpoint(region string) string {
-	return fmt.Sprintf("sts.%s.volcengineapi.com", strings.TrimSpace(region))
-}
-
-func volcengineOIDCSTSURL(region string) string {
-	return "https://" + buildVolcengineSTSEndpoint(region) + "/?Action=AssumeRoleWithOIDC&Version=2018-01-01"
+	return "tos-" + region + ".ivolces.com"
 }
 
 func (p *TOSProvider) buildPath(path string) string {
@@ -145,11 +129,10 @@ func (p *TOSProvider) buildPath(path string) string {
 
 // Upload implements ObjectStorageProvider.
 func (p *TOSProvider) Upload(ctx context.Context, path string, data io.Reader) error {
-	fullPath := p.buildPath(path)
 	_, err := p.client.PutObjectV2(ctx, &vtos.PutObjectV2Input{
 		PutObjectBasicInput: vtos.PutObjectBasicInput{
 			Bucket: p.bucket,
-			Key:    fullPath,
+			Key:    p.buildPath(path),
 		},
 		Content: data,
 	})
@@ -158,10 +141,9 @@ func (p *TOSProvider) Upload(ctx context.Context, path string, data io.Reader) e
 
 // Download implements ObjectStorageProvider.
 func (p *TOSProvider) Download(ctx context.Context, path string) (io.ReadCloser, error) {
-	fullPath := p.buildPath(path)
 	result, err := p.client.GetObjectV2(ctx, &vtos.GetObjectV2Input{
 		Bucket: p.bucket,
-		Key:    fullPath,
+		Key:    p.buildPath(path),
 	})
 	if err != nil {
 		return nil, err
@@ -171,20 +153,18 @@ func (p *TOSProvider) Download(ctx context.Context, path string) (io.ReadCloser,
 
 // Delete implements ObjectStorageProvider.
 func (p *TOSProvider) Delete(ctx context.Context, path string) error {
-	fullPath := p.buildPath(path)
 	_, err := p.client.DeleteObjectV2(ctx, &vtos.DeleteObjectV2Input{
 		Bucket: p.bucket,
-		Key:    fullPath,
+		Key:    p.buildPath(path),
 	})
 	return err
 }
 
 // Exists implements ObjectStorageProvider.
 func (p *TOSProvider) Exists(ctx context.Context, path string) (bool, error) {
-	fullPath := p.buildPath(path)
 	_, err := p.client.HeadObjectV2(ctx, &vtos.HeadObjectV2Input{
 		Bucket: p.bucket,
-		Key:    fullPath,
+		Key:    p.buildPath(path),
 	})
 	if err != nil {
 		if isTOSNotFound(err) {
@@ -197,19 +177,14 @@ func (p *TOSProvider) Exists(ctx context.Context, path string) (bool, error) {
 
 // List implements ObjectStorageProvider.
 func (p *TOSProvider) List(ctx context.Context, prefix string) ([]string, error) {
-	fullPrefix := p.buildPath(prefix)
-	var (
-		token   string
-		objects []string
-	)
+	input := &vtos.ListObjectsType2Input{
+		Bucket:       p.bucket,
+		Prefix:       p.buildPath(prefix),
+		ListOnlyOnce: true,
+	}
+	var objects []string
 	for {
-		output, err := p.client.ListObjectsV2(ctx, &vtos.ListObjectsV2Input{
-			Bucket: p.bucket,
-			ListObjectsInput: vtos.ListObjectsInput{
-				Prefix: fullPrefix,
-				Marker: token,
-			},
-		})
+		output, err := p.client.ListObjectsType2(ctx, input)
 		if err != nil {
 			return nil, err
 		}
@@ -217,11 +192,10 @@ func (p *TOSProvider) List(ctx context.Context, prefix string) ([]string, error)
 			objects = append(objects, object.Key)
 		}
 		if !output.IsTruncated {
-			break
+			return objects, nil
 		}
-		token = output.NextMarker
+		input.ContinuationToken = output.NextContinuationToken
 	}
-	return objects, nil
 }
 
 func isTOSNotFound(err error) bool {
@@ -253,9 +227,10 @@ func (p *staticVolcengineTOSCredentialProvider) GetCredential(ctx context.Contex
 // cachedVolcengineTOSCredentialProvider caches a short-lived STS credential and
 // refreshes it synchronously, mirroring the COS assume-role provider: a refresh
 // is attempted once the credential is within duration/10 of expiry; while a
-// refresh fails the cached credential is still served until it expires; after
-// that the refresh error is returned and an expired credential is never
-// handed out. Both the OIDC hop and the AssumeRole hop use this type.
+// refresh fails (or returns an already-expired credential) the cached
+// credential is still served until it expires; after that the refresh error is
+// returned and an expired credential is never handed out. Both the OIDC hop
+// and the AssumeRole hop use this type.
 type cachedVolcengineTOSCredentialProvider struct {
 	duration time.Duration
 	refresh  func(ctx context.Context) (*volcengineTOSCredential, error)
@@ -281,13 +256,10 @@ func (p *cachedVolcengineTOSCredentialProvider) GetCredential(ctx context.Contex
 	if err != nil {
 		return p.credentialAfterRefreshError(ctx, err)
 	}
-	if fresh.expiresAt.IsZero() || fresh.expiresAt.Unix() <= 0 {
-		fresh.expiresAt = time.Now().Add(p.duration)
+	if !time.Now().Before(fresh.expiresAt) {
+		return p.credentialAfterRefreshError(ctx, errors.New("Volcengine STS returned an expired credential"))
 	}
 	p.credential = *fresh
-	if !time.Now().Before(p.credential.expiresAt) {
-		return volcengineTOSCredential{}, fmt.Errorf("Volcengine credential refresh returned an expired credential")
-	}
 	return p.credential, nil
 }
 
@@ -303,43 +275,10 @@ func (p *cachedVolcengineTOSCredentialProvider) credentialAfterRefreshError(ctx 
 	return volcengineTOSCredential{}, refreshErr
 }
 
-type volcengineAssumeRoleResult struct {
-	accessKey    string
-	secretKey    string
-	sessionToken string
-	expiresAt    time.Time
-}
-
-// newAssumeRoleVolcengineCredentialProvider chains a base credential (static AK
-// or OIDC) into sts:AssumeRole.
-func newAssumeRoleVolcengineCredentialProvider(base volcengineTOSCredentialProvider, roleTRN, region string) *cachedVolcengineTOSCredentialProvider {
-	return &cachedVolcengineTOSCredentialProvider{
-		duration: tosAssumeRoleDuration,
-		refresh: func(ctx context.Context) (*volcengineTOSCredential, error) {
-			baseCred, err := base.GetCredential(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("resolve base credential for AssumeRole: %w", err)
-			}
-			result, err := assumeVolcengineRole(ctx, baseCred, roleTRN, defaultTOSAssumeRoleSessionName, tosAssumeRoleDuration, region)
-			if err != nil {
-				return nil, err
-			}
-			return &volcengineTOSCredential{
-				accessKey:    result.accessKey,
-				secretKey:    result.secretKey,
-				sessionToken: result.sessionToken,
-				expiresAt:    result.expiresAt,
-			}, nil
-		},
-	}
-}
-
-func newVolcengineTOSCredentialProvider(cfg *TOSConfig, region string) (volcengineTOSCredentialProvider, error) {
-	region = strings.TrimSpace(region)
-
-	var baseProvider volcengineTOSCredentialProvider
+func newVolcengineTOSCredentialProvider(cfg *TOSConfig, sts volcengineSTSClient) (volcengineTOSCredentialProvider, error) {
+	var base volcengineTOSCredentialProvider
 	if cfg != nil && cfg.AccessKey != "" && cfg.SecretAccessKey != "" {
-		baseProvider = &staticVolcengineTOSCredentialProvider{
+		base = &staticVolcengineTOSCredentialProvider{
 			credential: volcengineTOSCredential{
 				accessKey:    cfg.AccessKey,
 				secretKey:    cfg.SecretAccessKey,
@@ -347,22 +286,58 @@ func newVolcengineTOSCredentialProvider(cfg *TOSConfig, region string) (volcengi
 			},
 		}
 	} else {
-		oidcProvider, err := newVolcengineOIDCCredentialProvider(region)
+		oidc, err := newVolcengineOIDCCredentialProvider(sts)
 		if err != nil {
 			return nil, err
 		}
-		baseProvider = oidcProvider
+		base = oidc
 	}
 
-	if cfg == nil || strings.TrimSpace(cfg.AssumeRoleARN) == "" {
-		return baseProvider, nil
+	roleTRN := ""
+	if cfg != nil {
+		roleTRN = strings.TrimSpace(cfg.AssumeRoleARN)
 	}
-
-	if region == "" {
-		return nil, fmt.Errorf("region is required to assume a Volcengine role")
+	if roleTRN == "" {
+		return base, nil
 	}
+	return newAssumeRoleVolcengineCredentialProvider(base, sts, roleTRN), nil
+}
 
-	return newAssumeRoleVolcengineCredentialProvider(baseProvider, strings.TrimSpace(cfg.AssumeRoleARN), region), nil
+// newAssumeRoleVolcengineCredentialProvider chains a base credential (static AK
+// or OIDC) into sts:AssumeRole.
+func newAssumeRoleVolcengineCredentialProvider(base volcengineTOSCredentialProvider, sts volcengineSTSClient, roleTRN string) *cachedVolcengineTOSCredentialProvider {
+	return &cachedVolcengineTOSCredentialProvider{
+		duration: tosAssumeRoleDuration,
+		refresh: func(ctx context.Context) (*volcengineTOSCredential, error) {
+			baseCred, err := base.GetCredential(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("resolve base credential for AssumeRole: %w", err)
+			}
+			return sts.assumeRole(ctx, baseCred, roleTRN)
+		},
+	}
+}
+
+// newVolcengineOIDCCredentialProvider reads the token file and role TRN from
+// the same environment variables the Volcengine SDK's own OIDC provider uses.
+func newVolcengineOIDCCredentialProvider(sts volcengineSTSClient) (*cachedVolcengineTOSCredentialProvider, error) {
+	tokenFile := strings.TrimSpace(os.Getenv(envVolcengineOIDCTokenFile))
+	if tokenFile == "" {
+		return nil, fmt.Errorf("%s is required", envVolcengineOIDCTokenFile)
+	}
+	if _, err := os.Stat(tokenFile); err != nil {
+		return nil, fmt.Errorf("stat %s: %w", envVolcengineOIDCTokenFile, err)
+	}
+	roleTRN := strings.TrimSpace(os.Getenv(envVolcengineOIDCRoleTRN))
+	if roleTRN == "" {
+		return nil, fmt.Errorf("%s is required", envVolcengineOIDCRoleTRN)
+	}
+	return &cachedVolcengineTOSCredentialProvider{
+		duration: tosAssumeRoleDuration,
+		refresh: func(ctx context.Context) (*volcengineTOSCredential, error) {
+			return sts.assumeRoleWithOIDC(ctx, tokenFile, roleTRN)
+		},
+	}, nil
 }
 
 // volcengineTOSCredentials adapts the cached credential provider to the TOS
@@ -372,7 +347,8 @@ func newVolcengineTOSCredentialProvider(cfg *TOSConfig, region string) (volcengi
 // which fetches a token eagerly during construction and, on a failed refresh
 // after expiry, keeps signing with the expired credential.
 type volcengineTOSCredentials struct {
-	provider volcengineTOSCredentialProvider
+	provider       volcengineTOSCredentialProvider
+	refreshTimeout time.Duration
 
 	mu      sync.Mutex
 	lastErr error
@@ -381,14 +357,11 @@ type volcengineTOSCredentials struct {
 func (c *volcengineTOSCredentials) resolve() (vtos.Credential, error) {
 	// The TOS credentials interface has no request context. Bound the refresh
 	// so a stalled STS cannot block storage operations indefinitely.
-	ctx, cancel := context.WithTimeout(context.Background(), tosCredentialRefreshTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), c.refreshTimeout)
 	defer cancel()
 	cred, err := c.provider.GetCredential(ctx)
 	if err != nil {
 		return vtos.Credential{}, err
-	}
-	if cred.accessKey == "" || cred.secretKey == "" {
-		return vtos.Credential{}, fmt.Errorf("Volcengine TOS credentials are empty")
 	}
 	return vtos.Credential{
 		AccessKeyID:     cred.accessKey,
@@ -443,50 +416,49 @@ func (t *tosCredentialGuardTransport) RoundTrip(ctx context.Context, req *vtos.R
 	return t.next.RoundTrip(ctx, req)
 }
 
-func newVolcengineTOSCredentials(providerConfig *ProviderConfig) (*volcengineTOSCredentials, error) {
-	cfg := (*TOSConfig)(nil)
-	if providerConfig != nil {
-		cfg = providerConfig.TOS
-	}
-	region := ""
-	if providerConfig != nil {
-		region = providerConfig.Region
-	}
-	provider, err := newVolcengineTOSCredentialProvider(cfg, region)
-	if err != nil {
-		return nil, err
-	}
-	return &volcengineTOSCredentials{provider: provider}, nil
+// volcengineSTSClient issues the STS calls behind the TOS credential chain.
+type volcengineSTSClient interface {
+	assumeRoleWithOIDC(ctx context.Context, tokenFile, roleTRN string) (*volcengineTOSCredential, error)
+	assumeRole(ctx context.Context, base volcengineTOSCredential, roleTRN string) (*volcengineTOSCredential, error)
 }
 
-func newVolcengineOIDCCredentialProvider(region string) (*cachedVolcengineTOSCredentialProvider, error) {
-	tokenFile := strings.TrimSpace(os.Getenv(envVolcengineOIDCTokenFile))
-	if tokenFile == "" {
-		return nil, fmt.Errorf("%s is required", envVolcengineOIDCTokenFile)
-	}
-	if _, err := os.Stat(tokenFile); err != nil {
-		return nil, fmt.Errorf("stat %s: %w", envVolcengineOIDCTokenFile, err)
-	}
-	roleTRN := strings.TrimSpace(os.Getenv(envVolcengineOIDCRoleTRN))
-	if roleTRN == "" {
-		return nil, fmt.Errorf("%s is required", envVolcengineOIDCRoleTRN)
-	}
-	region = strings.TrimSpace(region)
-	if region == "" {
-		return nil, fmt.Errorf("region is required for Volcengine OIDC")
-	}
-	return &cachedVolcengineTOSCredentialProvider{
-		duration: tosAssumeRoleDuration,
-		refresh: func(ctx context.Context) (*volcengineTOSCredential, error) {
-			return assumeVolcengineRoleWithOIDC(ctx, tokenFile, roleTRN, region, tosAssumeRoleDuration)
-		},
-	}, nil
+// volcengineSTS is the STS client for one region. Each instance owns its
+// http.Client: the volcengine SDK mutates the client it is handed (installs a
+// Transport and rewrites its Proxy on every call), so sharing one across
+// providers or with http.DefaultClient would race.
+type volcengineSTS struct {
+	region     string
+	httpClient *http.Client
+	oidcURL    string
 }
 
-func assumeVolcengineRoleWithOIDC(ctx context.Context, tokenFile, roleTRN, region string, duration time.Duration) (*volcengineTOSCredential, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+func newVolcengineSTS(region string) *volcengineSTS {
+	return &volcengineSTS{
+		region: region,
+		// Backstop above tosCredentialRefreshTimeout; the context deadline is
+		// the one that normally fires.
+		httpClient: &http.Client{Timeout: 12 * time.Second},
+		oidcURL:    "https://" + volcengineSTSHost(region) + "/?Action=AssumeRoleWithOIDC&Version=2018-01-01",
 	}
+}
+
+func volcengineSTSHost(region string) string {
+	return "sts." + region + ".volcengineapi.com"
+}
+
+// volcengineExpiry parses the RFC3339 expiration STS returns, falling back to
+// the requested duration when it is missing or malformed.
+func volcengineExpiry(raw string) time.Time {
+	if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(raw)); err == nil {
+		return parsed
+	}
+	return time.Now().Add(tosAssumeRoleDuration)
+}
+
+// assumeRoleWithOIDC calls AssumeRoleWithOIDC directly instead of through the
+// SDK's OIDCCredentialsProvider, which sends DurationSeconds+60 and is
+// therefore rejected by a role whose MaxSessionDuration is the 3600s default.
+func (s *volcengineSTS) assumeRoleWithOIDC(ctx context.Context, tokenFile, roleTRN string) (*volcengineTOSCredential, error) {
 	raw, err := os.ReadFile(tokenFile)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", envVolcengineOIDCTokenFile, err)
@@ -495,24 +467,21 @@ func assumeVolcengineRoleWithOIDC(ctx context.Context, tokenFile, roleTRN, regio
 	if oidcToken == "" {
 		return nil, fmt.Errorf("%s is empty", envVolcengineOIDCTokenFile)
 	}
-	if duration <= 0 {
-		duration = tosAssumeRoleDuration
-	}
 
 	form := url.Values{}
 	form.Set("RoleTrn", roleTRN)
 	form.Set("OIDCToken", oidcToken)
 	form.Set("RoleSessionName", defaultTOSAssumeRoleSessionName)
-	form.Set("DurationSeconds", fmt.Sprintf("%d", int(duration/time.Second)))
+	form.Set("DurationSeconds", strconv.Itoa(int(tosAssumeRoleDuration/time.Second)))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oidcSTSURL(region), strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.oidcURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("build OIDC STS request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := oidcHTTPClient.Do(req)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request OIDC STS: %w", err)
 	}
@@ -536,52 +505,33 @@ func assumeVolcengineRoleWithOIDC(ctx context.Context, tokenFile, roleTRN, regio
 		return nil, fmt.Errorf("OIDC STS returned status %d", resp.StatusCode)
 	}
 
-	accessKey := strings.TrimSpace(stsResp.Result.Credentials.AccessKeyId)
-	secretKey := strings.TrimSpace(stsResp.Result.Credentials.SecretAccessKey)
-	token := strings.TrimSpace(stsResp.Result.Credentials.SessionToken)
-	if accessKey == "" || secretKey == "" || token == "" {
-		return nil, fmt.Errorf("OIDC STS returned empty credentials")
+	creds := stsResp.Result.Credentials
+	cred := &volcengineTOSCredential{
+		accessKey:    strings.TrimSpace(creds.AccessKeyId),
+		secretKey:    strings.TrimSpace(creds.SecretAccessKey),
+		sessionToken: strings.TrimSpace(creds.SessionToken),
+		expiresAt:    volcengineExpiry(creds.Expiration),
 	}
-
-	expiresAt := time.Now().Add(duration)
-	if raw := strings.TrimSpace(stsResp.Result.Credentials.Expiration); raw != "" {
-		if parsed, parseErr := time.Parse(time.RFC3339, raw); parseErr == nil {
-			expiresAt = parsed
-		}
+	if cred.accessKey == "" || cred.secretKey == "" || cred.sessionToken == "" {
+		return nil, errors.New("OIDC STS returned empty credentials")
 	}
-	return &volcengineTOSCredential{
-		accessKey:    accessKey,
-		secretKey:    secretKey,
-		sessionToken: token,
-		expiresAt:    expiresAt,
-	}, nil
+	return cred, nil
 }
 
-func assumeVolcengineRoleWithSTS(
-	ctx context.Context,
-	baseCred volcengineTOSCredential,
-	roleTRN, roleSessionName string,
-	duration time.Duration,
-	region string,
-) (*volcengineAssumeRoleResult, error) {
-	region = strings.TrimSpace(region)
-	if region == "" {
-		return nil, fmt.Errorf("region is required to assume a Volcengine role")
-	}
-
+func (s *volcengineSTS) assumeRole(ctx context.Context, base volcengineTOSCredential, roleTRN string) (*volcengineTOSCredential, error) {
 	sess, err := session.NewSession(volcengine.NewConfig().
-		WithRegion(region).
-		WithEndpoint(buildVolcengineSTSEndpoint(region)).
-		WithHTTPClient(stsHTTPClient).
-		WithCredentials(vecredentials.NewStaticCredentials(baseCred.accessKey, baseCred.secretKey, baseCred.sessionToken)))
+		WithRegion(s.region).
+		WithEndpoint(volcengineSTSHost(s.region)).
+		WithHTTPClient(s.httpClient).
+		WithCredentials(vecredentials.NewStaticCredentials(base.accessKey, base.secretKey, base.sessionToken)))
 	if err != nil {
 		return nil, fmt.Errorf("create volcengine session: %w", err)
 	}
 
 	output, err := volcsts.New(sess).AssumeRoleWithContext(ctx, &volcsts.AssumeRoleInput{
 		RoleTrn:         volcengine.String(roleTRN),
-		RoleSessionName: volcengine.String(roleSessionName),
-		DurationSeconds: volcengine.Int32(int32(duration / time.Second)),
+		RoleSessionName: volcengine.String(defaultTOSAssumeRoleSessionName),
+		DurationSeconds: volcengine.Int32(int32(tosAssumeRoleDuration / time.Second)),
 	})
 	if err != nil {
 		// The volcengine SDK wraps a canceled context in its own error type
@@ -594,27 +544,17 @@ func assumeVolcengineRoleWithSTS(
 		return nil, err
 	}
 	if output == nil || output.Credentials == nil {
-		return nil, fmt.Errorf("Volcengine STS returned empty credentials")
+		return nil, errors.New("Volcengine STS returned empty credentials")
 	}
 
-	accessKey := volcengine.StringValue(output.Credentials.AccessKeyId)
-	secretKey := volcengine.StringValue(output.Credentials.SecretAccessKey)
-	token := volcengine.StringValue(output.Credentials.SessionToken)
-	if accessKey == "" || secretKey == "" || token == "" {
-		return nil, fmt.Errorf("Volcengine STS returned empty credentials")
+	cred := &volcengineTOSCredential{
+		accessKey:    volcengine.StringValue(output.Credentials.AccessKeyId),
+		secretKey:    volcengine.StringValue(output.Credentials.SecretAccessKey),
+		sessionToken: volcengine.StringValue(output.Credentials.SessionToken),
+		expiresAt:    volcengineExpiry(volcengine.StringValue(output.Credentials.ExpiredTime)),
 	}
-
-	expiresAt := time.Now().Add(duration)
-	if raw := strings.TrimSpace(volcengine.StringValue(output.Credentials.ExpiredTime)); raw != "" {
-		if parsed, parseErr := time.Parse(time.RFC3339, raw); parseErr == nil {
-			expiresAt = parsed
-		}
+	if cred.accessKey == "" || cred.secretKey == "" || cred.sessionToken == "" {
+		return nil, errors.New("Volcengine STS returned empty credentials")
 	}
-
-	return &volcengineAssumeRoleResult{
-		accessKey:    accessKey,
-		secretKey:    secretKey,
-		sessionToken: token,
-		expiresAt:    expiresAt,
-	}, nil
+	return cred, nil
 }
