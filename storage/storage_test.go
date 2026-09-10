@@ -89,6 +89,22 @@ func TestCOSProviderFactory(t *testing.T) {
 	assert.NotNil(t, provider, "COS provider should not be nil")
 }
 
+func TestTOSProviderFactory(t *testing.T) {
+	providerConfig := &storage.ProviderConfig{
+		Type:   storage.ProviderTypeTOS,
+		Bucket: "nextgen-metering-dev-cn-beijing-ng",
+		Region: "cn-beijing",
+		TOS: &storage.TOSConfig{
+			AccessKey:       "ak",
+			SecretAccessKey: "sk",
+		},
+	}
+
+	provider, err := storage.NewObjectStorageProvider(providerConfig)
+	assert.NoError(t, err, "Failed to create TOS provider")
+	assert.NotNil(t, provider, "TOS provider should not be nil")
+}
+
 func TestMeteringWriterWithLocalFS(t *testing.T) {
 	// Create temporary directory
 	tempDir := filepath.Join(os.TempDir(), "tidb-metering-test", "writer")

@@ -16,6 +16,8 @@ func NewObjectStorageProvider(config *ProviderConfig) (ObjectStorageProvider, er
 		return provider.NewOSSProvider(config)
 	case provider.ProviderTypeCOS:
 		return provider.NewCOSProvider(config)
+	case provider.ProviderTypeTOS:
+		return provider.NewTOSProvider(config)
 	case provider.ProviderTypeLocalFS:
 		return provider.NewLocalFSProvider(config)
 	case provider.ProviderTypeGCS:

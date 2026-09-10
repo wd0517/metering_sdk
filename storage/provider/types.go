@@ -14,6 +14,8 @@ const (
 	ProviderTypeOSS ProviderType = "oss"
 	// ProviderTypeCOS TencentCloud COS storage provider
 	ProviderTypeCOS ProviderType = "cos"
+	// ProviderTypeTOS Volcengine TOS storage provider
+	ProviderTypeTOS ProviderType = "tos"
 	// ProviderTypeLocalFS local filesystem storage provider
 	ProviderTypeLocalFS ProviderType = "localfs"
 )
@@ -32,6 +34,7 @@ type ProviderConfig struct {
 	Azure   *AzureConfig   `json:"azure,omitempty"`   // Azure Blob Storage specific configuration
 	OSS     *OSSConfig     `json:"oss,omitempty"`     // Alibaba Cloud OSS specific configuration
 	COS     *COSConfig     `json:"cos,omitempty"`     // TencentCloud COS specific configuration
+	TOS     *TOSConfig     `json:"tos,omitempty"`     // Volcengine TOS specific configuration
 	LocalFS *LocalFSConfig `json:"localfs,omitempty"` // local filesystem specific configuration
 }
 
@@ -71,6 +74,16 @@ type OSSConfig struct {
 
 // COSConfig TencentCloud COS specific configuration
 type COSConfig struct {
+	AssumeRoleARN   string `json:"assume_role_arn,omitempty"`
+	AccessKey       string `json:"access_key,omitempty"`
+	SecretAccessKey string `json:"secret_access_key,omitempty"`
+	SessionToken    string `json:"session_token,omitempty"`
+}
+
+// TOSConfig Volcengine TOS specific configuration.
+// AssumeRoleARN holds a Volcengine IAM Role TRN; the field name stays
+// parallel with COS/OSS so URI query assume-role-arn keeps working.
+type TOSConfig struct {
 	AssumeRoleARN   string `json:"assume_role_arn,omitempty"`
 	AccessKey       string `json:"access_key,omitempty"`
 	SecretAccessKey string `json:"secret_access_key,omitempty"`

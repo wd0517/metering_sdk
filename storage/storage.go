@@ -30,6 +30,7 @@ type (
 	AzureConfig    = provider.AzureConfig
 	OSSConfig      = provider.OSSConfig
 	COSConfig      = provider.COSConfig
+	TOSConfig      = provider.TOSConfig
 	LocalFSConfig  = provider.LocalFSConfig
 )
 
@@ -40,5 +41,6 @@ const (
 	ProviderTypeAzure   = provider.ProviderTypeAzure
 	ProviderTypeOSS     = provider.ProviderTypeOSS
 	ProviderTypeCOS     = provider.ProviderTypeCOS
+	ProviderTypeTOS     = provider.ProviderTypeTOS
 	ProviderTypeLocalFS = provider.ProviderTypeLocalFS
 )
