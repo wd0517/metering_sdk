@@ -23,18 +23,12 @@ import (
 
 const (
 	defaultTOSAssumeRoleSessionName = "metering-writer"
-	// Volcengine IAM roles default to MaxSessionDuration=3600s and STS rejects
-	// a larger DurationSeconds with InvalidParameter, so request exactly that.
+	// Volcengine role MaxSessionDuration defaults to 3600s; STS rejects more with InvalidParameter.
 	tosAssumeRoleDuration = 3600 * time.Second
-	// tosCredentialRefreshTimeout bounds one credential refresh, which is at
-	// most two STS hops (AssumeRoleWithOIDC, then AssumeRole). The TOS
-	// credentials interface has no request context, so this is the only
-	// deadline on that path.
+	// Bounds one refresh (up to two STS hops). vtos.Credentials has no request
+	// context, so this is the only deadline on the credential path.
 	tosCredentialRefreshTimeout = 10 * time.Second
-	// A successful AssumeRoleWithOIDC response is a few KB (the SessionToken
-	// dominates). 64KB leaves ample headroom while still bounding a hostile or
-	// misrouted endpoint; exceeding it is reported explicitly instead of
-	// surfacing as a JSON decode error on a truncated body.
+	// Real responses are a few KB; this bounds a hostile or misrouted endpoint.
 	oidcSTSMaxResponseBytes    = 64 << 10
 	envVolcengineOIDCTokenFile = "VOLCENGINE_OIDC_TOKEN_FILE"
 	envVolcengineOIDCRoleTRN   = "VOLCENGINE_OIDC_ROLE_TRN"
@@ -52,11 +46,8 @@ func NewTOSProvider(providerConfig *ProviderConfig) (*TOSProvider, error) {
 	return newTOSProvider(providerConfig, nil, nil)
 }
 
-// newTOSProvider builds the provider. sts is the STS client behind the
-// credential chain and next is the network transport behind the credential
-// guard; nil selects the real STS client and the SDK's tuned default
-// transport (dial/read/write timeouts, DNS cache, connection pool). Tests
-// inject fakes.
+// newTOSProvider is NewTOSProvider with an injectable STS client and network
+// transport; nil selects the real ones.
 func newTOSProvider(providerConfig *ProviderConfig, sts volcengineSTSClient, next vtos.Transport) (*TOSProvider, error) {
 	if providerConfig.Type != ProviderTypeTOS {
 		return nil, fmt.Errorf("invalid provider type: %s, expected: %s", providerConfig.Type, ProviderTypeTOS)
@@ -64,10 +55,8 @@ func newTOSProvider(providerConfig *ProviderConfig, sts volcengineSTSClient, nex
 	if providerConfig.Bucket == "" {
 		return nil, fmt.Errorf("bucket name is required for TOS provider")
 	}
-	// TOS signs with SigV4, whose credential scope embeds the region. The TOS
-	// SDK can only infer it for a handful of public volces.com hosts, not the
-	// intranet or custom endpoints used here, so an empty region would build a
-	// client whose every request fails with 403. Fail at construction instead.
+	// The SDK infers the SigV4 region only for public volces.com hosts, never
+	// for intranet or custom endpoints; without it every request gets a 403.
 	region := strings.TrimSpace(providerConfig.Region)
 	if region == "" {
 		return nil, fmt.Errorf("region is required for TOS provider (SigV4 signing scope), even when endpoint is set")
@@ -92,10 +81,8 @@ func newTOSProvider(providerConfig *ProviderConfig, sts volcengineSTSClient, nex
 	client, err := vtos.NewClientV2(buildTOSEndpoint(region, providerConfig.Endpoint),
 		vtos.WithRegion(region),
 		vtos.WithCredentials(credentials),
-		// WithTransport is deprecated in favour of WithHTTPTransport, but it is
-		// the only hook that sees the signed *vtos.Request while keeping the
-		// SDK's default transport underneath; WithHTTPTransport discards that
-		// transport's tuning.
+		// Deprecated, but the only hook that sees the signed request while
+		// keeping the SDK's default transport; WithHTTPTransport drops the latter.
 		vtos.WithTransport(&tosCredentialGuardTransport{creds: credentials, next: next}),
 	)
 	if err != nil {
@@ -109,8 +96,7 @@ func newTOSProvider(providerConfig *ProviderConfig, sts volcengineSTSClient, nex
 	}, nil
 }
 
-// buildTOSEndpoint returns the explicit endpoint or the regional intranet
-// endpoint. The TOS SDK parses an optional http:// or https:// scheme itself.
+// buildTOSEndpoint keeps any scheme on a custom endpoint; the SDK parses it.
 func buildTOSEndpoint(region, endpoint string) string {
 	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
 		return endpoint
@@ -224,13 +210,9 @@ func (p *staticVolcengineTOSCredentialProvider) GetCredential(ctx context.Contex
 	return p.credential, nil
 }
 
-// cachedVolcengineTOSCredentialProvider caches a short-lived STS credential and
-// refreshes it synchronously, mirroring the COS assume-role provider: a refresh
-// is attempted once the credential is within duration/10 of expiry; while a
-// refresh fails (or returns an already-expired credential) the cached
-// credential is still served until it expires; after that the refresh error is
-// returned and an expired credential is never handed out. Both the OIDC hop
-// and the AssumeRole hop use this type.
+// cachedVolcengineTOSCredentialProvider refreshes synchronously once the
+// credential is within duration/10 of expiry. While a refresh fails the cached
+// credential is served until it expires; after that the refresh error surfaces.
 type cachedVolcengineTOSCredentialProvider struct {
 	duration time.Duration
 	refresh  func(ctx context.Context) (*volcengineTOSCredential, error)
@@ -263,12 +245,9 @@ func (p *cachedVolcengineTOSCredentialProvider) GetCredential(ctx context.Contex
 	return p.credential, nil
 }
 
-// credentialAfterRefreshError returns the cached credential while it is still
-// valid. Once it has expired, the refresh error must be surfaced. The context
-// is deliberately not consulted here: on this path it only ever carries the
-// internal refresh timeout, and a refresh that timed out is exactly the case
-// in which the still-valid credential must keep being served. When there is
-// nothing to serve, refreshErr already wraps the context error.
+// credentialAfterRefreshError deliberately ignores the context: on this path it
+// is only the refresh timeout, and a timed-out refresh is exactly when the
+// still-valid cached credential must keep being served.
 func (p *cachedVolcengineTOSCredentialProvider) credentialAfterRefreshError(refreshErr error) (volcengineTOSCredential, error) {
 	if p.credential.accessKey != "" && time.Now().Before(p.credential.expiresAt) {
 		return p.credential, nil
@@ -304,8 +283,6 @@ func newVolcengineTOSCredentialProvider(cfg *TOSConfig, sts volcengineSTSClient)
 	return newAssumeRoleVolcengineCredentialProvider(base, sts, roleTRN), nil
 }
 
-// newAssumeRoleVolcengineCredentialProvider chains a base credential (static AK
-// or OIDC) into sts:AssumeRole.
 func newAssumeRoleVolcengineCredentialProvider(base volcengineTOSCredentialProvider, sts volcengineSTSClient, roleTRN string) *cachedVolcengineTOSCredentialProvider {
 	return &cachedVolcengineTOSCredentialProvider{
 		duration: tosAssumeRoleDuration,
@@ -319,8 +296,6 @@ func newAssumeRoleVolcengineCredentialProvider(base volcengineTOSCredentialProvi
 	}
 }
 
-// newVolcengineOIDCCredentialProvider reads the token file and role TRN from
-// the same environment variables the Volcengine SDK's own OIDC provider uses.
 func newVolcengineOIDCCredentialProvider(sts volcengineSTSClient) (*cachedVolcengineTOSCredentialProvider, error) {
 	tokenFile := strings.TrimSpace(os.Getenv(envVolcengineOIDCTokenFile))
 	if tokenFile == "" {
@@ -341,12 +316,9 @@ func newVolcengineOIDCCredentialProvider(sts volcengineSTSClient) (*cachedVolcen
 	}, nil
 }
 
-// volcengineTOSCredentials adapts the cached credential provider to the TOS
-// SDK Credentials interface. Resolution is lazy: no STS call happens in
-// NewTOSProvider; the first storage request triggers it, matching the COS
-// provider. This type intentionally does not use vtos.NewFederationCredentials,
-// which fetches a token eagerly during construction and, on a failed refresh
-// after expiry, keeps signing with the expired credential.
+// volcengineTOSCredentials adapts the provider chain to vtos.Credentials. It
+// replaces vtos.NewFederationCredentials, which calls STS eagerly in the
+// constructor and keeps signing with an expired credential once a refresh fails.
 type volcengineTOSCredentials struct {
 	provider       volcengineTOSCredentialProvider
 	refreshTimeout time.Duration
@@ -356,8 +328,6 @@ type volcengineTOSCredentials struct {
 }
 
 func (c *volcengineTOSCredentials) resolve() (vtos.Credential, error) {
-	// The TOS credentials interface has no request context. Bound the refresh
-	// so a stalled STS cannot block storage operations indefinitely.
 	ctx, cancel := context.WithTimeout(context.Background(), c.refreshTimeout)
 	defer cancel()
 	cred, err := c.provider.GetCredential(ctx)
@@ -371,11 +341,9 @@ func (c *volcengineTOSCredentials) resolve() (vtos.Credential, error) {
 	}, nil
 }
 
-// Credential implements vtos.Credentials. The interface cannot return an
-// error, so a failed resolve yields an empty Credential and records the error;
-// tosCredentialGuardTransport turns the resulting unsigned request into that
-// error instead of letting TOS answer 403. Only failures are recorded so the
-// most recent cause survives a concurrent successful resolve.
+// Credential implements vtos.Credentials, which cannot return an error: a
+// failed resolve yields an empty Credential and records the error for
+// tosCredentialGuardTransport to surface.
 func (c *volcengineTOSCredentials) Credential() vtos.Credential {
 	cred, err := c.resolve()
 	if err != nil {
@@ -393,14 +361,11 @@ func (c *volcengineTOSCredentials) lastResolveError() error {
 	return c.lastErr
 }
 
-// tosSigV4EmptyAccessKeyPrefix is how the TOS SDK renders an Authorization
-// header signed with an empty AccessKeyID (Credential=<ak>/<date>/...).
+// Authorization prefix the TOS SDK emits when it signs with an empty AccessKeyID.
 const tosSigV4EmptyAccessKeyPrefix = "TOS4-HMAC-SHA256 Credential=/"
 
-// tosCredentialGuardTransport sits between the TOS SDK signer and the network.
-// The SDK signs before RoundTrip, so a request carrying an empty AccessKeyID
-// means credential resolution failed; surface that error to the caller (as the
-// S3, OSS and COS providers do) instead of sending it and receiving a 403.
+// tosCredentialGuardTransport fails a request the SDK signed with an empty
+// AccessKeyID (credential resolution failed) instead of sending it for a 403.
 type tosCredentialGuardTransport struct {
 	creds *volcengineTOSCredentials
 	next  vtos.Transport
@@ -417,16 +382,13 @@ func (t *tosCredentialGuardTransport) RoundTrip(ctx context.Context, req *vtos.R
 	return t.next.RoundTrip(ctx, req)
 }
 
-// volcengineSTSClient issues the STS calls behind the TOS credential chain.
 type volcengineSTSClient interface {
 	assumeRoleWithOIDC(ctx context.Context, tokenFile, roleTRN string) (*volcengineTOSCredential, error)
 	assumeRole(ctx context.Context, base volcengineTOSCredential, roleTRN string) (*volcengineTOSCredential, error)
 }
 
-// volcengineSTS is the STS client for one region. Each instance owns its
-// http.Client: the volcengine SDK mutates the client it is handed (installs a
-// Transport and rewrites its Proxy on every call), so sharing one across
-// providers or with http.DefaultClient would race.
+// volcengineSTS owns its http.Client: the volcengine SDK mutates the client it
+// is handed (Transport, Proxy), so sharing one across providers would race.
 type volcengineSTS struct {
 	region     string
 	httpClient *http.Client
@@ -436,8 +398,7 @@ type volcengineSTS struct {
 func newVolcengineSTS(region string) *volcengineSTS {
 	return &volcengineSTS{
 		region: region,
-		// Backstop above tosCredentialRefreshTimeout; the context deadline is
-		// the one that normally fires.
+		// Backstop above tosCredentialRefreshTimeout.
 		httpClient: &http.Client{Timeout: 12 * time.Second},
 		oidcURL:    "https://" + volcengineSTSHost(region) + "/?Action=AssumeRoleWithOIDC&Version=2018-01-01",
 	}
@@ -447,8 +408,6 @@ func volcengineSTSHost(region string) string {
 	return "sts." + region + ".volcengineapi.com"
 }
 
-// volcengineExpiry parses the RFC3339 expiration STS returns, falling back to
-// the requested duration when it is missing or malformed.
 func volcengineExpiry(raw string) time.Time {
 	if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(raw)); err == nil {
 		return parsed
@@ -456,9 +415,8 @@ func volcengineExpiry(raw string) time.Time {
 	return time.Now().Add(tosAssumeRoleDuration)
 }
 
-// assumeRoleWithOIDC calls AssumeRoleWithOIDC directly instead of through the
-// SDK's OIDCCredentialsProvider, which sends DurationSeconds+60 and is
-// therefore rejected by a role whose MaxSessionDuration is the 3600s default.
+// assumeRoleWithOIDC bypasses the SDK's OIDCCredentialsProvider, which sends
+// DurationSeconds+60 and is rejected by a role at the 3600s default maximum.
 func (s *volcengineSTS) assumeRoleWithOIDC(ctx context.Context, tokenFile, roleTRN string) (*volcengineTOSCredential, error) {
 	raw, err := os.ReadFile(tokenFile)
 	if err != nil {
@@ -535,10 +493,8 @@ func (s *volcengineSTS) assumeRole(ctx context.Context, base volcengineTOSCreden
 		DurationSeconds: volcengine.Int32(int32(tosAssumeRoleDuration / time.Second)),
 	})
 	if err != nil {
-		// The volcengine SDK wraps a canceled context in its own error type
-		// without Unwrap. Re-attach the context error so callers can
-		// errors.Is(err, context.DeadlineExceeded) and tell a timeout from an
-		// STS rejection.
+		// The SDK's error type has no Unwrap; re-attach the context error so
+		// callers can errors.Is(err, context.DeadlineExceeded).
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("Volcengine STS AssumeRole: %w (%v)", ctxErr, err)
 		}

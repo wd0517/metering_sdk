@@ -25,8 +25,7 @@ const (
 	testTOSOIDCRoleTRN = "trn:iam::1:role/metering-oidc"
 )
 
-// fakeVolcengineSTS replaces the real STS client. A hop left unset fails, so a
-// test cannot silently exercise a path it did not expect.
+// fakeVolcengineSTS fails any hop left unset so a test cannot take an unexpected path.
 type fakeVolcengineSTS struct {
 	oidcFn       func(ctx context.Context, tokenFile, roleTRN string) (*volcengineTOSCredential, error)
 	assumeRoleFn func(ctx context.Context, base volcengineTOSCredential, roleTRN string) (*volcengineTOSCredential, error)
@@ -61,8 +60,7 @@ func staticTOSCredentialProvider() *staticVolcengineTOSCredentialProvider {
 	}
 }
 
-// setOIDCEnv points VOLCENGINE_OIDC_* at a token file whose content carries
-// surrounding whitespace.
+// setOIDCEnv writes a token file with surrounding whitespace and points VOLCENGINE_OIDC_* at it.
 func setOIDCEnv(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	require.NoError(t, os.WriteFile(tokenFile, []byte("  jwt-token\n"), 0o600))
@@ -70,8 +68,6 @@ func setOIDCEnv(t *testing.T) {
 	t.Setenv(envVolcengineOIDCRoleTRN, testTOSOIDCRoleTRN)
 }
 
-// startOIDCSTSServer serves AssumeRoleWithOIDC with the given handler and
-// returns a real STS client pointed at it.
 func startOIDCSTSServer(t *testing.T, handler http.HandlerFunc) *volcengineSTS {
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
@@ -125,8 +121,6 @@ func TestNewTOSProviderRejectsInvalidConfig(t *testing.T) {
 			want: "bucket name is required",
 		},
 		{
-			// SigV4 needs the region in its signing scope and the TOS SDK cannot
-			// infer it from intranet or custom hosts, so an endpoint is no substitute.
 			name: "missing region despite endpoint",
 			cfg:  &ProviderConfig{Type: ProviderTypeTOS, Bucket: testTOSBucket, Endpoint: "https://tos-cn-beijing.ivolces.com", TOS: static},
 			want: "region is required",
@@ -225,8 +219,7 @@ func TestVolcengineAssumeRoleReusesValidCredentialAfterRefreshError(t *testing.T
 		return nil, errors.New("sts unavailable")
 	}
 
-	// Inside the window every call retries STS synchronously; while it fails
-	// the still-valid credential is served.
+	// Still inside the window: STS is retried, and while it fails the valid credential is served.
 	second, err := provider.GetCredential(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, first, second)
@@ -234,8 +227,7 @@ func TestVolcengineAssumeRoleReusesValidCredentialAfterRefreshError(t *testing.T
 }
 
 func TestVolcengineAssumeRoleFailsClosedOnceExpired(t *testing.T) {
-	// Credential already expired when handed out (clock skew / STS returning
-	// a past time): it must never be served, and the refresh error surfaces.
+	// An already-expired credential (clock skew) is never served.
 	sts := &fakeVolcengineSTS{}
 	sts.assumeRoleFn = func(context.Context, volcengineTOSCredential, string) (*volcengineTOSCredential, error) {
 		return stsCredential("old", -time.Second), nil
@@ -314,8 +306,7 @@ func TestVolcengineOIDCTrimsTokenAndUsesRoleMaxDuration(t *testing.T) {
 
 func TestVolcengineOIDCRejectsOversizedResponseExplicitly(t *testing.T) {
 	sts := startOIDCSTSServer(t, func(w http.ResponseWriter, r *http.Request) {
-		// Valid JSON that is larger than the cap: the error must name the size
-		// limit, not surface as a decode failure on a truncated body.
+		// Oversized but valid JSON: the error must name the cap, not a decode failure.
 		padding := strings.Repeat("x", oidcSTSMaxResponseBytes)
 		_, _ = fmt.Fprintf(w, `{"Result":{"Credentials":{"AccessKeyId":"ak","SecretAccessKey":"sk","SessionToken":%q}}}`, padding)
 	})
@@ -374,8 +365,7 @@ func TestTOSCredentialGuardSurfacesResolveErrorInsteadOfSending(t *testing.T) {
 		return nil, stsErr
 	}
 
-	// Real provider, real TOS SDK signer and guard; only STS and the network
-	// layer are replaced.
+	// Real TOS SDK signer and guard; only STS and the network are faked.
 	next := &recordingTOSTransport{}
 	provider, err := newTOSProvider(&ProviderConfig{
 		Type:   ProviderTypeTOS,
@@ -426,8 +416,7 @@ func TestVolcengineTOSCredentialsResolvesLazilyAndRecovers(t *testing.T) {
 	require.NoError(t, err)
 	creds := &volcengineTOSCredentials{provider: provider, refreshTimeout: tosCredentialRefreshTimeout}
 
-	// While STS is down: the SDK-facing Credential() degrades to an empty
-	// credential instead of panicking or blocking, and the error is recorded.
+	// STS down: Credential() degrades to empty and records the error.
 	require.Equal(t, vtos.Credential{}, creds.Credential())
 	require.ErrorIs(t, creds.lastResolveError(), stsErr)
 	require.Equal(t, 1, calls)
@@ -460,8 +449,7 @@ func TestVolcengineTOSCredentialsServesCachedCredentialWhileSTSHangs(t *testing.
 	first, err := creds.resolve()
 	require.NoError(t, err)
 
-	// STS hangs until the refresh deadline fires. The timeout is the only
-	// context on this path, so it must not discard the still-valid credential.
+	// STS hangs past the refresh timeout; the valid cached credential must still be served.
 	sts.assumeRoleFn = func(ctx context.Context, _ volcengineTOSCredential, _ string) (*volcengineTOSCredential, error) {
 		<-ctx.Done()
 		return nil, fmt.Errorf("Volcengine STS AssumeRole: %w", ctx.Err())
@@ -488,8 +476,7 @@ func (b *blockingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 }
 
 func TestTOSCredentialsBoundAssumeRoleRefresh(t *testing.T) {
-	// Real volcengine STS client over a transport that never answers: the
-	// refresh timeout must reach the HTTP layer and surface as DeadlineExceeded.
+	// Real STS client over a transport that never answers: the timeout must reach HTTP.
 	transport := &blockingTransport{}
 	sts := newVolcengineSTS(testTOSRegion)
 	sts.httpClient = &http.Client{Transport: transport}
