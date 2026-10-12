@@ -28,6 +28,8 @@ const (
 	// Bounds one refresh (up to two STS hops). vtos.Credentials has no request
 	// context, so this is the only deadline on the credential path.
 	tosCredentialRefreshTimeout = 10 * time.Second
+	// Avoid retrying a failed early refresh on every object operation.
+	tosCredentialRefreshBackoff = 30 * time.Second
 	// Real responses are a few KB; this bounds a hostile or misrouted endpoint.
 	oidcSTSMaxResponseBytes    = 64 << 10
 	envVolcengineOIDCTokenFile = "VOLCENGINE_OIDC_TOKEN_FILE"
@@ -210,15 +212,24 @@ func (p *staticVolcengineTOSCredentialProvider) GetCredential(ctx context.Contex
 	return p.credential, nil
 }
 
-// cachedVolcengineTOSCredentialProvider refreshes synchronously once the
-// credential is within duration/10 of expiry. While a refresh fails the cached
-// credential is served until it expires; after that the refresh error surfaces.
+// cachedVolcengineTOSCredentialProvider starts one bounded refresh on demand
+// within duration/10 of expiry. Valid credentials remain immediately usable;
+// only callers without a valid credential wait for the shared refresh.
 type cachedVolcengineTOSCredentialProvider struct {
-	duration time.Duration
-	refresh  func(ctx context.Context) (*volcengineTOSCredential, error)
+	duration       time.Duration
+	refreshTimeout time.Duration // Zero uses tosCredentialRefreshTimeout.
+	refresh        func(ctx context.Context) (*volcengineTOSCredential, error)
 
 	mu         sync.Mutex
 	credential volcengineTOSCredential
+	inflight   *volcengineTOSCredentialRefresh
+	retryAfter time.Time
+}
+
+type volcengineTOSCredentialRefresh struct {
+	done       chan struct{}
+	credential volcengineTOSCredential
+	err        error
 }
 
 func (p *cachedVolcengineTOSCredentialProvider) GetCredential(ctx context.Context) (volcengineTOSCredential, error) {
@@ -227,37 +238,76 @@ func (p *cachedVolcengineTOSCredentialProvider) GetCredential(ctx context.Contex
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	now := time.Now()
+	cached := p.credential
+	valid := cached.accessKey != "" && now.Before(cached.expiresAt)
+	refreshDue := !now.Before(cached.expiresAt.Add(-p.duration/10)) && !now.Before(p.retryAfter)
+	if p.inflight == nil && (!valid || refreshDue) {
+		p.inflight = &volcengineTOSCredentialRefresh{done: make(chan struct{})}
+		go p.refreshCredential(p.inflight)
+	}
+	inflight := p.inflight
+	p.mu.Unlock()
 
-	refreshAt := p.credential.expiresAt.Add(-p.duration / 10)
-	if p.credential.accessKey != "" && time.Now().Before(refreshAt) {
-		return p.credential, nil
+	if valid {
+		return cached, nil
 	}
-
-	fresh, err := p.refresh(ctx)
-	if err != nil {
-		return p.credentialAfterRefreshError(err)
+	select {
+	case <-ctx.Done():
+		return volcengineTOSCredential{}, ctx.Err()
+	case <-inflight.done:
+		if err := ctx.Err(); err != nil {
+			return volcengineTOSCredential{}, err
+		}
+		if inflight.err != nil {
+			return volcengineTOSCredential{}, inflight.err
+		}
+		if !time.Now().Before(inflight.credential.expiresAt) {
+			return volcengineTOSCredential{}, errors.New("Volcengine STS returned an expired credential")
+		}
+		return inflight.credential, nil
 	}
-	if !time.Now().Before(fresh.expiresAt) {
-		return p.credentialAfterRefreshError(errors.New("Volcengine STS returned an expired credential"))
-	}
-	p.credential = *fresh
-	return p.credential, nil
 }
 
-// credentialAfterRefreshError deliberately ignores the context: on this path it
-// is only the refresh timeout, and a timed-out refresh is exactly when the
-// still-valid cached credential must keep being served.
-func (p *cachedVolcengineTOSCredentialProvider) credentialAfterRefreshError(refreshErr error) (volcengineTOSCredential, error) {
-	if p.credential.accessKey != "" && time.Now().Before(p.credential.expiresAt) {
-		return p.credential, nil
+func (p *cachedVolcengineTOSCredentialProvider) refreshCredential(inflight *volcengineTOSCredentialRefresh) {
+	timeout := p.refreshTimeout
+	if timeout <= 0 {
+		timeout = tosCredentialRefreshTimeout
 	}
-	return volcengineTOSCredential{}, refreshErr
+	// A canceled waiter must not cancel work shared by other object operations.
+	// The same deadline covers the entire OIDC -> AssumeRole chain.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	fresh, err := p.refresh(ctx)
+	if err == nil {
+		switch {
+		case ctx.Err() != nil:
+			err = ctx.Err()
+		case fresh == nil || fresh.accessKey == "" || fresh.secretKey == "" || fresh.sessionToken == "":
+			err = errors.New("Volcengine STS returned empty credentials")
+		case !time.Now().Before(fresh.expiresAt):
+			err = errors.New("Volcengine STS returned an expired credential")
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err != nil {
+		p.retryAfter = time.Now().Add(tosCredentialRefreshBackoff)
+	} else {
+		p.credential = *fresh
+		p.retryAfter = time.Time{}
+		inflight.credential = *fresh
+	}
+	inflight.err = err
+	p.inflight = nil
+	close(inflight.done)
 }
 
 func newVolcengineTOSCredentialProvider(cfg *TOSConfig, sts volcengineSTSClient) (volcengineTOSCredentialProvider, error) {
 	var base volcengineTOSCredentialProvider
-	if cfg != nil && cfg.AccessKey != "" && cfg.SecretAccessKey != "" {
+	staticCredentials := cfg != nil && cfg.AccessKey != "" && cfg.SecretAccessKey != ""
+	if staticCredentials {
 		base = &staticVolcengineTOSCredentialProvider{
 			credential: volcengineTOSCredential{
 				accessKey:    cfg.AccessKey,
@@ -278,7 +328,16 @@ func newVolcengineTOSCredentialProvider(cfg *TOSConfig, sts volcengineSTSClient)
 		roleTRN = strings.TrimSpace(cfg.AssumeRoleARN)
 	}
 	if roleTRN == "" {
-		return base, nil
+		if staticCredentials {
+			return base, nil
+		}
+		return &cachedVolcengineTOSCredentialProvider{
+			duration: tosAssumeRoleDuration,
+			refresh: func(ctx context.Context) (*volcengineTOSCredential, error) {
+				cred, err := base.GetCredential(ctx)
+				return &cred, err
+			},
+		}, nil
 	}
 	return newAssumeRoleVolcengineCredentialProvider(base, sts, roleTRN), nil
 }
@@ -296,7 +355,32 @@ func newAssumeRoleVolcengineCredentialProvider(base volcengineTOSCredentialProvi
 	}
 }
 
-func newVolcengineOIDCCredentialProvider(sts volcengineSTSClient) (*cachedVolcengineTOSCredentialProvider, error) {
+// The OIDC base is deliberately uncached. Only the final credential is cached,
+// so both STS hops run serially with one deadline and one shared HTTP client.
+type oidcVolcengineTOSCredentialProvider struct {
+	sts       volcengineSTSClient
+	tokenFile string
+	roleTRN   string
+}
+
+func (p *oidcVolcengineTOSCredentialProvider) GetCredential(ctx context.Context) (volcengineTOSCredential, error) {
+	if err := ctx.Err(); err != nil {
+		return volcengineTOSCredential{}, err
+	}
+	cred, err := p.sts.assumeRoleWithOIDC(ctx, p.tokenFile, p.roleTRN)
+	if err != nil {
+		return volcengineTOSCredential{}, err
+	}
+	if cred == nil || cred.accessKey == "" || cred.secretKey == "" || cred.sessionToken == "" {
+		return volcengineTOSCredential{}, errors.New("OIDC STS returned empty credentials")
+	}
+	if !time.Now().Before(cred.expiresAt) {
+		return volcengineTOSCredential{}, errors.New("OIDC STS returned an expired credential")
+	}
+	return *cred, nil
+}
+
+func newVolcengineOIDCCredentialProvider(sts volcengineSTSClient) (*oidcVolcengineTOSCredentialProvider, error) {
 	tokenFile := strings.TrimSpace(os.Getenv(envVolcengineOIDCTokenFile))
 	if tokenFile == "" {
 		return nil, fmt.Errorf("%s is required", envVolcengineOIDCTokenFile)
@@ -308,12 +392,7 @@ func newVolcengineOIDCCredentialProvider(sts volcengineSTSClient) (*cachedVolcen
 	if roleTRN == "" {
 		return nil, fmt.Errorf("%s is required", envVolcengineOIDCRoleTRN)
 	}
-	return &cachedVolcengineTOSCredentialProvider{
-		duration: tosAssumeRoleDuration,
-		refresh: func(ctx context.Context) (*volcengineTOSCredential, error) {
-			return sts.assumeRoleWithOIDC(ctx, tokenFile, roleTRN)
-		},
-	}, nil
+	return &oidcVolcengineTOSCredentialProvider{sts: sts, tokenFile: tokenFile, roleTRN: roleTRN}, nil
 }
 
 // volcengineTOSCredentials adapts the provider chain to vtos.Credentials. It

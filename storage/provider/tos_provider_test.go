@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,11 +178,12 @@ func TestVolcengineTOSCredentialProviderStatic(t *testing.T) {
 
 func TestVolcengineAssumeRoleCachesUntilRefreshWindow(t *testing.T) {
 	calls := 0
+	var gotBase volcengineTOSCredential
+	var gotRole string
 	sts := &fakeVolcengineSTS{
 		assumeRoleFn: func(_ context.Context, base volcengineTOSCredential, roleTRN string) (*volcengineTOSCredential, error) {
 			calls++
-			require.Equal(t, "ak", base.accessKey)
-			require.Equal(t, testTOSRoleTRN, roleTRN)
+			gotBase, gotRole = base, roleTRN
 			return stsCredential("tmp", 2*time.Hour), nil
 		},
 	}
@@ -198,6 +200,8 @@ func TestVolcengineAssumeRoleCachesUntilRefreshWindow(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 1, calls)
+	require.Equal(t, "ak", gotBase.accessKey)
+	require.Equal(t, testTOSRoleTRN, gotRole)
 	require.Equal(t, first, second)
 	require.Equal(t, "tmp-ak", first.accessKey)
 }
@@ -219,10 +223,11 @@ func TestVolcengineAssumeRoleReusesValidCredentialAfterRefreshError(t *testing.T
 		return nil, errors.New("sts unavailable")
 	}
 
-	// Still inside the window: STS is retried, and while it fails the valid credential is served.
+	// Still inside the window: STS refreshes in the background while the cache remains usable.
 	second, err := provider.GetCredential(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, first, second)
+	waitForTOSRefresh(t, provider)
 	require.Equal(t, 1, calls)
 }
 
@@ -321,15 +326,14 @@ func TestVolcengineOIDCRejectsOversizedResponseExplicitly(t *testing.T) {
 func TestVolcengineOIDCThenAssumeRoleChain(t *testing.T) {
 	setOIDCEnv(t)
 	var gotBase volcengineTOSCredential
+	var gotTokenFile, gotOIDCRole, gotTargetRole string
 	sts := &fakeVolcengineSTS{
 		oidcFn: func(_ context.Context, tokenFile, roleTRN string) (*volcengineTOSCredential, error) {
-			require.Equal(t, os.Getenv(envVolcengineOIDCTokenFile), tokenFile)
-			require.Equal(t, testTOSOIDCRoleTRN, roleTRN)
+			gotTokenFile, gotOIDCRole = tokenFile, roleTRN
 			return stsCredential("oidc", time.Hour), nil
 		},
 		assumeRoleFn: func(_ context.Context, base volcengineTOSCredential, roleTRN string) (*volcengineTOSCredential, error) {
-			gotBase = base
-			require.Equal(t, testTOSRoleTRN, roleTRN)
+			gotBase, gotTargetRole = base, roleTRN
 			return stsCredential("wo", time.Hour), nil
 		},
 	}
@@ -343,6 +347,9 @@ func TestVolcengineOIDCThenAssumeRoleChain(t *testing.T) {
 	require.Equal(t, "wo-ak", cred.accessKey)
 	require.Equal(t, "oidc-ak", gotBase.accessKey)
 	require.Equal(t, "oidc-token", gotBase.sessionToken)
+	require.Equal(t, os.Getenv(envVolcengineOIDCTokenFile), gotTokenFile)
+	require.Equal(t, testTOSOIDCRoleTRN, gotOIDCRole)
+	require.Equal(t, testTOSRoleTRN, gotTargetRole)
 }
 
 type recordingTOSTransport struct {
@@ -436,37 +443,12 @@ func TestVolcengineTOSCredentialsResolvesLazilyAndRecovers(t *testing.T) {
 	require.Equal(t, 2, calls)
 }
 
-func TestVolcengineTOSCredentialsServesCachedCredentialWhileSTSHangs(t *testing.T) {
-	// Inside the refresh window (duration/10 = 6 min) with a minute left.
-	sts := &fakeVolcengineSTS{}
-	sts.assumeRoleFn = func(context.Context, volcengineTOSCredential, string) (*volcengineTOSCredential, error) {
-		return stsCredential("tmp", time.Minute), nil
-	}
-	creds := &volcengineTOSCredentials{
-		provider:       newAssumeRoleVolcengineCredentialProvider(staticTOSCredentialProvider(), sts, testTOSRoleTRN),
-		refreshTimeout: 200 * time.Millisecond,
-	}
-	first, err := creds.resolve()
-	require.NoError(t, err)
-
-	// STS hangs past the refresh timeout; the valid cached credential must still be served.
-	sts.assumeRoleFn = func(ctx context.Context, _ volcengineTOSCredential, _ string) (*volcengineTOSCredential, error) {
-		<-ctx.Done()
-		return nil, fmt.Errorf("Volcengine STS AssumeRole: %w", ctx.Err())
-	}
-	started := time.Now()
-	second, err := creds.resolve()
-	require.NoError(t, err)
-	require.Equal(t, first, second)
-	require.Less(t, time.Since(started), 5*time.Second)
-}
-
 type blockingTransport struct {
-	called bool
+	called atomic.Bool
 }
 
 func (b *blockingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	b.called = true
+	b.called.Store(true)
 	select {
 	case <-req.Context().Done():
 		return nil, req.Context().Err()
@@ -480,15 +462,94 @@ func TestTOSCredentialsBoundAssumeRoleRefresh(t *testing.T) {
 	transport := &blockingTransport{}
 	sts := newVolcengineSTS(testTOSRegion)
 	sts.httpClient = &http.Client{Transport: transport}
+	provider := newAssumeRoleVolcengineCredentialProvider(staticTOSCredentialProvider(), sts, testTOSRoleTRN)
+	provider.refreshTimeout = 100 * time.Millisecond
 	creds := &volcengineTOSCredentials{
-		provider:       newAssumeRoleVolcengineCredentialProvider(staticTOSCredentialProvider(), sts, testTOSRoleTRN),
-		refreshTimeout: 200 * time.Millisecond,
+		provider:       provider,
+		refreshTimeout: time.Second,
 	}
 
 	started := time.Now()
 	cred, err := creds.resolve()
-	require.True(t, transport.called)
+	require.True(t, transport.called.Load())
 	require.Empty(t, cred.AccessKeyID)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Less(t, time.Since(started), 5*time.Second)
+}
+
+func TestTOSRefreshOIDCChainUsesOneDeadline(t *testing.T) {
+	setOIDCEnv(t)
+	var oidcContext, roleContext context.Context
+	sts := &fakeVolcengineSTS{
+		oidcFn: func(ctx context.Context, _, _ string) (*volcengineTOSCredential, error) {
+			oidcContext = ctx
+			return stsCredential("oidc", time.Hour), nil
+		},
+		assumeRoleFn: func(ctx context.Context, _ volcengineTOSCredential, _ string) (*volcengineTOSCredential, error) {
+			roleContext = ctx
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	provider, err := newVolcengineTOSCredentialProvider(&TOSConfig{AssumeRoleARN: testTOSRoleTRN}, sts)
+	require.NoError(t, err)
+	provider.(*cachedVolcengineTOSCredentialProvider).refreshTimeout = 100 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = provider.GetCredential(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NoError(t, ctx.Err(), "the refresh budget, not the caller budget, must expire")
+	require.NotNil(t, oidcContext)
+	require.Same(t, oidcContext, roleContext, "both hops must share one refresh context")
+}
+
+func TestTOSRefreshCachesOnlyFinalOIDCCredential(t *testing.T) {
+	setOIDCEnv(t)
+	for _, assumeRole := range []bool{false, true} {
+		t.Run(fmt.Sprintf("assumeRole=%t", assumeRole), func(t *testing.T) {
+			var oidcCalls, roleCalls atomic.Int32
+			sts := &fakeVolcengineSTS{
+				oidcFn: func(context.Context, string, string) (*volcengineTOSCredential, error) {
+					oidcCalls.Add(1)
+					return stsCredential("oidc", time.Hour), nil
+				},
+				assumeRoleFn: func(context.Context, volcengineTOSCredential, string) (*volcengineTOSCredential, error) {
+					roleCalls.Add(1)
+					return stsCredential("role", time.Hour), nil
+				},
+			}
+			cfg := &TOSConfig{}
+			if assumeRole {
+				cfg.AssumeRoleARN = testTOSRoleTRN
+			}
+			provider, err := newVolcengineTOSCredentialProvider(cfg, sts)
+			require.NoError(t, err)
+			require.Zero(t, oidcCalls.Load(), "construction must remain lazy")
+			first, err := provider.GetCredential(context.Background())
+			require.NoError(t, err)
+			second, err := provider.GetCredential(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, first, second)
+			require.Equal(t, int32(1), oidcCalls.Load())
+			if assumeRole {
+				require.Equal(t, "role-ak", first.accessKey)
+				require.Equal(t, int32(1), roleCalls.Load())
+			} else {
+				require.Equal(t, "oidc-ak", first.accessKey)
+				require.Zero(t, roleCalls.Load())
+			}
+			// Expire the final credential: the whole chain refreshes, with no
+			// independently refreshing base cache sharing the STS HTTP client.
+			cache := provider.(*cachedVolcengineTOSCredentialProvider)
+			cache.mu.Lock()
+			cache.credential.expiresAt = time.Now().Add(-time.Second)
+			cache.mu.Unlock()
+			_, err = provider.GetCredential(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, int32(2), oidcCalls.Load())
+			if assumeRole {
+				require.Equal(t, int32(2), roleCalls.Load())
+			}
+		})
+	}
 }
